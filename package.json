@@ -1,0 +1,25 @@
+{
+  "name": "spider-movie-tracker",
+  "version": "1.0.0",
+  "description": "Node.js application that monitors an API and sends Telegram notifications",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "keywords": [
+    "api-monitor",
+    "telegram",
+    "notifications"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "node-telegram-bot-api": "^0.64.0",
+    "twilio": "^5.3.0"
+  }
+}
+
