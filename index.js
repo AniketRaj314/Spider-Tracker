@@ -21,7 +21,8 @@ const config = {
   telegramToken: process.env.TELEGRAM_BOT_TOKEN,
   telegramChatId: process.env.TELEGRAM_CHAT_ID,
   serverName: process.env.SERVER || 'Unknown', // Server name for startup message
-  targetMovie: process.env.MOVIE_NAME || null, // Movie name to search for
+  targetMovie: process.env.MOVIE_NAME || null, // Movie name to search for (legacy support)
+  movieKeywords: process.env.MOVIE_KEYWORDS ? JSON.parse(process.env.MOVIE_KEYWORDS) : null, // Array of keyword sets: [["keyword1", "keyword2"], ["keyword3"]]
   checkCondition: process.env.CHECK_CONDITION || null, // JavaScript expression to evaluate
   // Twilio configuration
   twilioAccountSid: process.env.TWILIO_ACCOUNT_SID,
@@ -98,6 +99,55 @@ function getAllFilmNames(movies) {
   return Array.from(filmNames);
 }
 
+// Function to check if a keyword set matches any film name
+// Returns the matching film names if all keywords in the set are found
+function checkKeywordSet(keywordSet, filmNames) {
+  if (!Array.isArray(keywordSet) || keywordSet.length === 0) {
+    return [];
+  }
+
+  const matchingFilms = [];
+
+  // Check each film name
+  filmNames.forEach(filmName => {
+    const filmNameLower = String(filmName).toLowerCase();
+
+    // Check if ALL keywords in the set are present in this film name
+    const allKeywordsFound = keywordSet.every(keyword =>
+      filmNameLower.includes(String(keyword).toLowerCase())
+    );
+
+    if (allKeywordsFound) {
+      matchingFilms.push(filmName);
+    }
+  });
+
+  return matchingFilms;
+}
+
+// Function to check if any keyword set matches
+// Returns array of { keywordSet, matchingFilms } for all matching sets
+function checkKeywordSets(keywordSets, filmNames) {
+  if (!Array.isArray(keywordSets) || keywordSets.length === 0) {
+    return [];
+  }
+
+  const matches = [];
+
+  keywordSets.forEach((keywordSet, index) => {
+    const matchingFilms = checkKeywordSet(keywordSet, filmNames);
+    if (matchingFilms.length > 0) {
+      matches.push({
+        keywordSet: keywordSet,
+        matchingFilms: matchingFilms,
+        setIndex: index
+      });
+    }
+  });
+
+  return matches;
+}
+
 // Function to check if condition is met
 function checkCondition(responseData) {
   try {
@@ -107,15 +157,25 @@ function checkCondition(responseData) {
     // Determine the condition to evaluate
     let conditionToEvaluate = config.checkCondition;
 
-    // If no condition is set, use default based on targetMovie
+    // If no condition is set, use default based on keyword sets or targetMovie
     if (!conditionToEvaluate) {
-      if (config.targetMovie) {
-        // If targetMovie is set, check if it exists
+      if (config.movieKeywords && Array.isArray(config.movieKeywords) && config.movieKeywords.length > 0) {
+        // Use keyword sets - check if any set matches
+        const matches = checkKeywordSets(config.movieKeywords, filmNames);
+        return matches.length > 0;
+      } else if (config.targetMovie) {
+        // Legacy: If targetMovie is set, check if it exists
         conditionToEvaluate = 'hasFilm(targetMovie)';
       } else {
         // Default: check if any movies are available
         conditionToEvaluate = 'movies.length > 0';
       }
+    }
+
+    // If we already handled keyword sets above, return the result
+    if (config.movieKeywords && !conditionToEvaluate) {
+      const matches = checkKeywordSets(config.movieKeywords, filmNames);
+      return matches.length > 0;
     }
 
     // Create a safe evaluation context
@@ -142,6 +202,22 @@ function checkCondition(responseData) {
   } catch (error) {
     logMessage('⚠️', `Error evaluating condition: ${error.message}`);
     return false;
+  }
+}
+
+// Function to get matching keyword sets and films
+function getMatchingKeywordSets(responseData) {
+  try {
+    const movies = getMovies(responseData);
+    const filmNames = getAllFilmNames(movies);
+
+    if (config.movieKeywords && Array.isArray(config.movieKeywords) && config.movieKeywords.length > 0) {
+      return checkKeywordSets(config.movieKeywords, filmNames);
+    }
+
+    return [];
+  } catch (error) {
+    return [];
   }
 }
 
@@ -248,13 +324,28 @@ async function monitor() {
     const movies = getMovies(result.data);
     const filmNames = getAllFilmNames(movies);
 
-    // Check if target movie was found
+    // Check for keyword set matches
+    const keywordMatches = getMatchingKeywordSets(result.data);
+
+    // Legacy: Check if target movie was found (for backward compatibility)
     const targetMovieFound = config.targetMovie &&
       filmNames.some(name => String(name).toLowerCase().includes(String(config.targetMovie).toLowerCase()));
 
     // Format movie information
     let movieInfo = '';
-    if (targetMovieFound) {
+    let trackingInfo = '';
+
+    if (keywordMatches.length > 0) {
+      movieInfo = `\n🎯 *KEYWORD SETS MATCHED!*\n\n`;
+      keywordMatches.forEach((match, index) => {
+        movieInfo += `*Set ${match.setIndex + 1}:* ${match.keywordSet.join(' AND ')}\n`;
+        match.matchingFilms.forEach((name) => {
+          movieInfo += `  ✅ ${name}\n`;
+        });
+        movieInfo += `\n`;
+      });
+      trackingInfo = `*Tracking:* ${keywordMatches.map(m => m.keywordSet.join(' AND ')).join(' OR ')}\n`;
+    } else if (targetMovieFound) {
       movieInfo = `\n🎯 *TARGET MOVIE FOUND!*\n\n`;
       const matchingMovies = filmNames.filter(name =>
         String(name).toLowerCase().includes(String(config.targetMovie).toLowerCase())
@@ -262,11 +353,12 @@ async function monitor() {
       matchingMovies.forEach((name) => {
         movieInfo += `✅ ${name}\n`;
       });
+      trackingInfo = `*Tracking:* ${config.targetMovie}\n`;
     }
 
     const message = `🎬 *PVR Cinema Update*\n\n` +
       `*Status:* ${result.data?.result || 'Unknown'}\n` +
-      (config.targetMovie ? `*Tracking:* ${config.targetMovie}\n` : '') +
+      trackingInfo +
       movieInfo +
       `\n*Time:* ${new Date().toLocaleString()}\n` +
       `*API Status:* ${result.status}`;
@@ -276,8 +368,8 @@ async function monitor() {
     // Make phone call if enabled
     await makePhoneCall();
 
-    const statusMsg = targetMovieFound
-      ? `🎯 TARGET MOVIE FOUND! Notification sent (${movies.length} movies, ${filmNames.length} unique film names)`
+    const statusMsg = (keywordMatches.length > 0 || targetMovieFound)
+      ? `🎯 MATCH FOUND! Notification sent (${movies.length} movies, ${filmNames.length} unique film names, ${keywordMatches.length} keyword set(s) matched)`
       : `✅ Condition met - notification sent (${movies.length} movies, ${filmNames.length} unique film names)`;
     logMessage('📬', statusMsg);
   } else {
@@ -289,12 +381,21 @@ async function monitor() {
 // Function to send startup message
 async function sendStartupMessage() {
   const timestamp = getISTTime();
-  const movieName = config.targetMovie || 'None';
+
+  let trackingInfo = 'None';
+  if (config.movieKeywords && Array.isArray(config.movieKeywords) && config.movieKeywords.length > 0) {
+    // Format keyword sets for display
+    trackingInfo = config.movieKeywords.map((set, index) =>
+      `Set ${index + 1}: (${set.join(' AND ')})`
+    ).join(' OR ');
+  } else if (config.targetMovie) {
+    trackingInfo = config.targetMovie;
+  }
 
   const startupMessage = `Spider-Tracker is now live 🚀\n\n` +
     `📅 Time: ${timestamp}\n` +
     `🌐 Server: ${config.serverName}\n` +
-    `📊 Movie being tracked: ${movieName}`;
+    `📊 Movie being tracked: ${trackingInfo}`;
 
   try {
     await bot.sendMessage(config.telegramChatId, startupMessage, {
@@ -314,10 +415,15 @@ console.log('='.repeat(60) + '\n');
 logMessage('🌐', `API URL: ${config.apiUrl}`);
 logMessage('⏱️', `Poll Interval: ${config.pollInterval / 1000} seconds`);
 logMessage('🖥️', `Server: ${config.serverName}`);
-if (config.targetMovie) {
+if (config.movieKeywords && Array.isArray(config.movieKeywords) && config.movieKeywords.length > 0) {
+  logMessage('🎬', `Keyword Sets: ${config.movieKeywords.map((set, i) => `Set ${i + 1}: (${set.join(' AND ')})`).join(' OR ')}`);
+} else if (config.targetMovie) {
   logMessage('🎬', `Target Movie: ${config.targetMovie}`);
 }
-logMessage('🔎', `Check Condition: ${config.checkCondition || (config.targetMovie ? `hasFilm('${config.targetMovie}')` : 'movies.length > 0')}`);
+const conditionDisplay = config.checkCondition ||
+  (config.movieKeywords ? 'keyword sets matching' :
+    (config.targetMovie ? `hasFilm('${config.targetMovie}')` : 'movies.length > 0'));
+logMessage('🔎', `Check Condition: ${conditionDisplay}`);
 
 console.log('\n' + '-'.repeat(60) + '\n');
 
