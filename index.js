@@ -74,6 +74,10 @@ if (!config.telegramToken || !config.telegramChatId) {
 // Initialize Telegram bot
 const bot = new TelegramBot(config.telegramToken, { polling: false });
 
+// Track which matches have already triggered a phone call
+// Key format: "filmCode1,filmCode2|theater1,theater2" or just "filmCode1" for legacy
+const phoneCallMade = new Set();
+
 // Function to extract movies from response
 function getMovies(responseData) {
   try {
@@ -518,14 +522,20 @@ async function sendTelegramNotification(message) {
 }
 
 // Function to make phone call via Twilio
-async function makePhoneCall() {
+async function makePhoneCall(matchKey) {
   if (!config.enablePhoneCall) {
-    return;
+    return false;
   }
 
   if (!config.twilioAccountSid || !config.twilioAuthToken || !config.twilioPhoneNumber || !config.phoneNumberToCall) {
     logMessage('⚠️', 'Twilio credentials not configured. Skipping phone call.');
-    return;
+    return false;
+  }
+
+  // Check if we've already called for this match
+  if (matchKey && phoneCallMade.has(matchKey)) {
+    logMessage('📞', `Phone call already made for this match (${matchKey}). Skipping call.`);
+    return false;
   }
 
   try {
@@ -541,9 +551,16 @@ async function makePhoneCall() {
       from: config.twilioPhoneNumber,
     });
 
+    // Mark this match as called
+    if (matchKey) {
+      phoneCallMade.add(matchKey);
+    }
+
     logMessage('📞', `Phone call initiated. Call SID: ${call.sid}`);
+    return true;
   } catch (error) {
     logMessage('❌', `Error making phone call: ${error.message}`);
+    return false;
   }
 }
 
@@ -701,11 +718,24 @@ async function monitor() {
 
       await sendTelegramNotification(message);
 
-      // Make phone call if enabled
-      await makePhoneCall();
+      // Create a unique key for this match to track phone calls
+      let matchKey = null;
+      if (keywordMatches.length > 0 && filmCommonCodes.length > 0) {
+        // Create key from film codes and theater names
+        const theaterNames = cinemaMatchResult && cinemaMatchResult.matchingTheaters.length > 0
+          ? cinemaMatchResult.matchingTheaters.map(t => t.name).sort().join(',')
+          : 'all';
+        matchKey = `${filmCommonCodes.sort().join(',')}|${theaterNames}`;
+      } else if (targetMovieFound) {
+        // Legacy mode - use movie name as key
+        matchKey = `legacy|${config.targetMovie}`;
+      }
+
+      // Make phone call if enabled (will skip if already called for this match)
+      const callMade = await makePhoneCall(matchKey);
 
       const statusMsg = (keywordMatches.length > 0 || targetMovieFound)
-        ? `🎯 MATCH FOUND! Notification sent (${movies.length} movies, ${filmNames.length} unique film names, ${keywordMatches.length} keyword set(s) matched${cinemaMatchResult ? `, ${cinemaMatchResult.matchingTheaters.length} theater(s)` : ''})`
+        ? `🎯 MATCH FOUND! Notification sent (${movies.length} movies, ${filmNames.length} unique film names, ${keywordMatches.length} keyword set(s) matched${cinemaMatchResult ? `, ${cinemaMatchResult.matchingTheaters.length} theater(s)` : ''}${callMade ? ', phone call made' : callMade === false && matchKey && phoneCallMade.has(matchKey) ? ', phone call skipped (already called)' : ''})`
         : `✅ Condition met - notification sent (${movies.length} movies, ${filmNames.length} unique film names)`;
       logMessage('📬', statusMsg);
     } else {
