@@ -29,6 +29,7 @@ const config = {
   theaterListingsApiUrl: process.env.THEATER_LISTINGS_API_URL || 'https://api3.pvrcinemas.com/api/v1/booking/content/msessions',
   theaterListingsApiHeaders: process.env.THEATER_LISTINGS_API_HEADERS ? JSON.parse(process.env.THEATER_LISTINGS_API_HEADERS) : {},
   theaterListingsApiBody: process.env.THEATER_LISTINGS_API_BODY ? JSON.parse(process.env.THEATER_LISTINGS_API_BODY) : null,
+  theaterListingsDateOverride: process.env.THEATER_LISTINGS_DATE_OVERRIDE || null, // Override date in YYYY-MM-DD format
   // Twilio configuration
   twilioAccountSid: process.env.TWILIO_ACCOUNT_SID,
   twilioAuthToken: process.env.TWILIO_AUTH_TOKEN,
@@ -334,35 +335,61 @@ async function fetchTheaterListings(filmCommonCode, releaseDate = null) {
       requestConfig.headers['Content-Type'] = 'application/json';
     }
 
-    // Convert releaseDate to API format (YYYY-MM-DD)
+    // Initialize dated variable
     let dated = null;
-    let releaseDateFormatted = null;
 
-    if (releaseDate) {
-      releaseDateFormatted = convertReleaseDateToAPIFormat(releaseDate);
+    // Check if date override is set in ENV
+    if (config.theaterListingsDateOverride) {
+      // Validate the override date format (YYYY-MM-DD)
+      if (/^\d{4}-\d{2}-\d{2}$/.test(config.theaterListingsDateOverride)) {
+        dated = config.theaterListingsDateOverride;
+        logMessage('📅', `Using date override from ENV: ${dated} for film ${filmCommonCode}`);
+      } else {
+        logMessage('⚠️', `Invalid date override format: ${config.theaterListingsDateOverride}. Expected YYYY-MM-DD. Falling back to calculated date.`);
+        // Fall through to normal date calculation
+      }
     }
 
-    // Get today's date in YYYY-MM-DD format
-    const today = new Date();
-    const todayYear = today.getFullYear();
-    const todayMonth = String(today.getMonth() + 1).padStart(2, '0');
-    const todayDay = String(today.getDate()).padStart(2, '0');
-    const todayFormatted = `${todayYear}-${todayMonth}-${todayDay}`;
+    // If no override or override was invalid, calculate date normally
+    if (!dated) {
+      let releaseDateFormatted = null;
 
-    // If releaseDate is available and in the future, use it; otherwise use today's date
-    if (releaseDateFormatted) {
-      // Compare dates: if today > releaseDate, use today; else use releaseDate
-      if (todayFormatted > releaseDateFormatted) {
-        dated = todayFormatted;
-        logMessage('📅', `ReleaseDate ${releaseDate} (${releaseDateFormatted}) is in the past, using today's date: ${dated}`);
-      } else {
-        dated = releaseDateFormatted;
-        logMessage('📅', `Using releaseDate ${releaseDate} (converted to ${dated}) for film ${filmCommonCode}`);
+      if (releaseDate) {
+        releaseDateFormatted = convertReleaseDateToAPIFormat(releaseDate);
       }
-    } else {
-      // If no releaseDate or conversion failed, use today's date as fallback
-      dated = todayFormatted;
-      logMessage('⚠️', `No releaseDate found for film ${filmCommonCode}, using today's date: ${dated}`);
+
+      // Get today's date in YYYY-MM-DD format
+      const today = new Date();
+      const todayYear = today.getFullYear();
+      const todayMonth = String(today.getMonth() + 1).padStart(2, '0');
+      const todayDay = String(today.getDate()).padStart(2, '0');
+      const todayFormatted = `${todayYear}-${todayMonth}-${todayDay}`;
+
+      // If releaseDate is available and in the future, use it; otherwise use today's date
+      if (releaseDateFormatted) {
+        // Compare dates: if today > releaseDate, use today; else use releaseDate
+        if (todayFormatted > releaseDateFormatted) {
+          dated = todayFormatted;
+          logMessage('📅', `ReleaseDate ${releaseDate} (${releaseDateFormatted}) is in the past, using today's date: ${dated}`);
+        } else {
+          dated = releaseDateFormatted;
+          logMessage('📅', `Using releaseDate ${releaseDate} (converted to ${dated}) for film ${filmCommonCode}`);
+        }
+      } else {
+        // If no releaseDate or conversion failed, use today's date as fallback
+        dated = todayFormatted;
+        logMessage('⚠️', `No releaseDate found for film ${filmCommonCode}, using today's date: ${dated}`);
+      }
+    }
+
+    // Final safety check - ensure dated is always set
+    if (!dated) {
+      const today = new Date();
+      const todayYear = today.getFullYear();
+      const todayMonth = String(today.getMonth() + 1).padStart(2, '0');
+      const todayDay = String(today.getDate()).padStart(2, '0');
+      dated = `${todayYear}-${todayMonth}-${todayDay}`;
+      logMessage('⚠️', `Date calculation failed, using today's date as fallback: ${dated}`);
     }
 
     // Build request body with mid and dated
