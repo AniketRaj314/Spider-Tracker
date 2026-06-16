@@ -11,24 +11,38 @@ const __dirname = dirname(__filename);
 // Load environment variables
 dotenv.config({ path: join(__dirname, '.env') });
 
+function parseJsonEnv(name, fallback) {
+  const value = process.env[name];
+  if (!value) {
+    return fallback;
+  }
+
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    console.error(`Invalid JSON in ${name}: ${error.message}`);
+    process.exit(1);
+  }
+}
+
 // Configuration
 const config = {
   apiUrl: process.env.API_URL,
   apiMethod: process.env.API_METHOD || 'GET',
-  apiHeaders: process.env.API_HEADERS ? JSON.parse(process.env.API_HEADERS) : {},
-  apiBody: process.env.API_BODY ? JSON.parse(process.env.API_BODY) : null,
+  apiHeaders: parseJsonEnv('API_HEADERS', {}),
+  apiBody: parseJsonEnv('API_BODY', null),
   pollInterval: parseInt(process.env.POLL_INTERVAL || '60000', 10), // Default: 60 seconds
   telegramToken: process.env.TELEGRAM_BOT_TOKEN,
   telegramChatId: process.env.TELEGRAM_CHAT_ID,
   serverName: process.env.SERVER || 'Unknown', // Server name for startup message
   targetMovie: process.env.MOVIE_NAME || null, // Movie name to search for (legacy support)
-  movieKeywords: process.env.MOVIE_KEYWORDS ? JSON.parse(process.env.MOVIE_KEYWORDS) : null, // Array of keyword sets: [["keyword1", "keyword2"], ["keyword3"]]
-  cinemaKeywords: process.env.CINEMA_KEYWORDS ? JSON.parse(process.env.CINEMA_KEYWORDS) : null, // Array of keyword sets for cinema names: [["Mall", "Asia"], ["PVR"]]
+  movieKeywords: parseJsonEnv('MOVIE_KEYWORDS', null), // Array of keyword sets: [["keyword1", "keyword2"], ["keyword3"]]
+  cinemaKeywords: parseJsonEnv('CINEMA_KEYWORDS', null), // Array of keyword sets for cinema names: [["Mall", "Asia"], ["PVR"]]
   checkCondition: process.env.CHECK_CONDITION || null, // JavaScript expression to evaluate
   // Theater listings API
   theaterListingsApiUrl: process.env.THEATER_LISTINGS_API_URL || 'https://api3.pvrcinemas.com/api/v1/booking/content/msessions',
-  theaterListingsApiHeaders: process.env.THEATER_LISTINGS_API_HEADERS ? JSON.parse(process.env.THEATER_LISTINGS_API_HEADERS) : {},
-  theaterListingsApiBody: process.env.THEATER_LISTINGS_API_BODY ? JSON.parse(process.env.THEATER_LISTINGS_API_BODY) : null,
+  theaterListingsApiHeaders: parseJsonEnv('THEATER_LISTINGS_API_HEADERS', {}),
+  theaterListingsApiBody: parseJsonEnv('THEATER_LISTINGS_API_BODY', null),
   theaterListingsDateOverride: process.env.THEATER_LISTINGS_DATE_OVERRIDE || null, // Override date in YYYY-MM-DD format
   // Twilio configuration
   twilioAccountSid: process.env.TWILIO_ACCOUNT_SID,
@@ -61,6 +75,26 @@ function logMessage(emoji, message, addSpacing = false) {
   console.log(`${spacing}${emoji} [${timestamp}] ${message}\n`);
 }
 
+function validateKeywordSets(name, value) {
+  if (value === null) {
+    return;
+  }
+
+  const isValid = Array.isArray(value) && value.every(set => Array.isArray(set));
+  if (!isValid) {
+    logMessage('❌', `Error: ${name} must be a JSON array of arrays, for example [["Spider","Man"]]`);
+    process.exit(1);
+  }
+}
+
+function escapeTelegramMarkdown(value) {
+  return String(value).replace(/([_*\[\]()`])/g, '\\$1');
+}
+
+function formatKeywordSet(keywordSet) {
+  return keywordSet.map(escapeTelegramMarkdown).join(' AND ');
+}
+
 // Validate configuration
 if (!config.apiUrl) {
   logMessage('❌', 'Error: API_URL is required in .env file');
@@ -71,6 +105,9 @@ if (!config.telegramToken || !config.telegramChatId) {
   logMessage('❌', 'Error: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required in .env file');
   process.exit(1);
 }
+
+validateKeywordSets('MOVIE_KEYWORDS', config.movieKeywords);
+validateKeywordSets('CINEMA_KEYWORDS', config.cinemaKeywords);
 
 // Initialize Telegram bot
 const bot = new TelegramBot(config.telegramToken, { polling: false });
@@ -159,7 +196,7 @@ function checkKeywordSets(keywordSets, filmNames) {
 }
 
 // Function to check if condition is met
-function checkCondition(responseData) {
+function checkCondition(responseData, httpStatus) {
   try {
     const movies = getMovies(responseData);
     const filmNames = getAllFilmNames(movies);
@@ -192,7 +229,9 @@ function checkCondition(responseData) {
     const context = {
       data: responseData,
       response: responseData,
-      status: responseData?.status,
+      status: httpStatus ?? responseData?.status,
+      dataStatus: responseData?.status,
+      result: responseData?.result,
       output: responseData?.output,
       movies: movies,
       filmNames: filmNames,
@@ -591,8 +630,25 @@ async function makePhoneCall(matchKey) {
   }
 }
 
+let isMonitorRunning = false;
+
 // Main monitoring function
 async function monitor() {
+  if (isMonitorRunning) {
+    logMessage('⏭️', 'Previous monitor run still in progress. Skipping this interval.');
+    return;
+  }
+
+  isMonitorRunning = true;
+
+  try {
+    await runMonitor();
+  } finally {
+    isMonitorRunning = false;
+  }
+}
+
+async function runMonitor() {
   logMessage('🔍', `Checking API: ${config.apiUrl}`, true);
 
   const result = await pingAPI();
@@ -609,7 +665,7 @@ async function monitor() {
   }
 
   // Check if condition is met
-  const conditionMet = checkCondition(result.data);
+  const conditionMet = checkCondition(result.data, result.status);
 
   if (conditionMet) {
     const movies = getMovies(result.data);
@@ -701,42 +757,42 @@ async function monitor() {
       if (keywordMatches.length > 0) {
         movieInfo = `\n🎯 *KEYWORD SETS MATCHED!*\n\n`;
         keywordMatches.forEach((match, index) => {
-          movieInfo += `*Set ${match.setIndex + 1}:* ${match.keywordSet.join(' AND ')}\n`;
+          movieInfo += `*Set ${match.setIndex + 1}:* ${formatKeywordSet(match.keywordSet)}\n`;
           match.matchingFilms.forEach((name) => {
-            movieInfo += `  ✅ ${name}\n`;
+            movieInfo += `  ✅ ${escapeTelegramMarkdown(name)}\n`;
           });
           movieInfo += `\n`;
         });
-        trackingInfo = `*Tracking:* ${keywordMatches.map(m => m.keywordSet.join(' AND ')).join(' OR ')}\n`;
+        trackingInfo = `*Tracking:* ${keywordMatches.map(m => formatKeywordSet(m.keywordSet)).join(' OR ')}\n`;
 
         // Add theater information
         if (cinemaMatchResult && cinemaMatchResult.matchingTheaters.length > 0) {
           theaterInfo = `\n🎭 *Available Theaters:*\n\n`;
           cinemaMatchResult.matchingTheaters.forEach((theater) => {
-            theaterInfo += `📍 ${theater.name}\n`;
+            theaterInfo += `📍 ${escapeTelegramMarkdown(theater.name)}\n`;
             if (theater.showCount > 0) {
               theaterInfo += `   Shows: ${theater.showCount}\n`;
             }
             if (theater.cityName) {
-              theaterInfo += `   City: ${theater.cityName}\n`;
+              theaterInfo += `   City: ${escapeTelegramMarkdown(theater.cityName)}\n`;
             }
             theaterInfo += `\n`;
           });
         }
 
         if (config.cinemaKeywords && cinemaMatchResult.matchedSets.length > 0) {
-          theaterInfo += `*Cinema Keywords Matched:* ${cinemaMatchResult.matchedSets.map(m => m.keywordSet.join(' AND ')).join(' OR ')}\n`;
+          theaterInfo += `*Cinema Keywords Matched:* ${cinemaMatchResult.matchedSets.map(m => formatKeywordSet(m.keywordSet)).join(' OR ')}\n`;
         }
       } else if (targetMovieFound) {
         movieInfo = `\n🎯 *TARGET MOVIE FOUND!*\n\n`;
         allMatchingFilms.forEach((name) => {
-          movieInfo += `✅ ${name}\n`;
+          movieInfo += `✅ ${escapeTelegramMarkdown(name)}\n`;
         });
-        trackingInfo = `*Tracking:* ${config.targetMovie}\n`;
+        trackingInfo = `*Tracking:* ${escapeTelegramMarkdown(config.targetMovie)}\n`;
       }
 
       const message = `🎬 *PVR Cinema Update*\n\n` +
-        `*Status:* ${result.data?.result || 'Unknown'}\n` +
+        `*Status:* ${escapeTelegramMarkdown(result.data?.result || 'Unknown')}\n` +
         trackingInfo +
         movieInfo +
         theaterInfo +
@@ -782,16 +838,16 @@ async function sendStartupMessage() {
   if (config.movieKeywords && Array.isArray(config.movieKeywords) && config.movieKeywords.length > 0) {
     // Format keyword sets for display
     trackingInfo = config.movieKeywords.map((set, index) =>
-      `Set ${index + 1}: (${set.join(' AND ')})`
+      `Set ${index + 1}: (${formatKeywordSet(set)})`
     ).join(' OR ');
   } else if (config.targetMovie) {
-    trackingInfo = config.targetMovie;
+    trackingInfo = escapeTelegramMarkdown(config.targetMovie);
   }
 
   let cinemaInfo = '';
   if (config.cinemaKeywords && Array.isArray(config.cinemaKeywords) && config.cinemaKeywords.length > 0) {
     cinemaInfo = `\n🎭 Cinema being tracked: ${config.cinemaKeywords.map((set, index) =>
-      `Set ${index + 1}: (${set.join(' AND ')})`
+      `Set ${index + 1}: (${formatKeywordSet(set)})`
     ).join(' OR ')}`;
   } else {
     cinemaInfo = '\n🎭 Cinema: All theaters';
@@ -799,7 +855,7 @@ async function sendStartupMessage() {
 
   const startupMessage = `Spider-Tracker is now live 🚀\n\n` +
     `📅 Time: ${timestamp}\n` +
-    `🌐 Server: ${config.serverName}\n` +
+    `🌐 Server: ${escapeTelegramMarkdown(config.serverName)}\n` +
     `📊 Movie being tracked: ${trackingInfo}` +
     cinemaInfo;
 
@@ -843,8 +899,10 @@ console.log('\n' + '-'.repeat(60) + '\n');
   await sendStartupMessage();
 
   // Run immediately after startup message is sent, then on interval
-  monitor();
-  setInterval(monitor, config.pollInterval);
+  void monitor();
+  setInterval(() => {
+    void monitor();
+  }, config.pollInterval);
 })();
 
 // Handle graceful shutdown
@@ -854,4 +912,3 @@ process.on('SIGINT', () => {
   console.log('='.repeat(60) + '\n');
   process.exit(0);
 });
-
